@@ -1,12 +1,17 @@
 use anyhow::Ok;
 use std::{
     collections::HashMap,
+    fmt::Debug,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
-    net::TcpStream,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    str::SplitInclusive,
+    sync::Arc,
 };
+
+use tokio::sync::Mutex;
+
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::command::Command;
 #[derive(Debug)]
@@ -17,13 +22,18 @@ pub struct KvStore {
     total_writes: usize,
 }
 
-pub fn handle_client(stream: TcpStream, locked_store: Arc<Mutex<KvStore>>) -> anyhow::Result<()> {
-    let mut reader = BufReader::new(stream);
+pub async fn handle_client(
+    mut stream: tokio::net::TcpStream,
+    locked_store: Arc<Mutex<KvStore>>,
+) -> anyhow::Result<()> {
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = tokio::io::BufReader::new(read_half);
 
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
 
-        match reader.read_line(&mut line) {
+        match reader.read_line(&mut line).await {
             std::result::Result::Ok(0) => {
                 println!("client disconnected");
                 break;
@@ -31,24 +41,17 @@ pub fn handle_client(stream: TcpStream, locked_store: Arc<Mutex<KvStore>>) -> an
 
             std::result::Result::Ok(_) => match Command::read_from_line(line.trim()) {
                 Err(e) => {
-                    let response_stream = reader.get_mut();
-                    writeln!(response_stream, "{}", e)?;
-                    response_stream.flush()?;
+                    let response_stream = format!("error {}\n", e);
+                    write_half.write_all(response_stream.as_bytes()).await?;
+                    write_half.flush().await?;
                     continue;
                 }
 
                 std::result::Result::Ok(Command::Set { key, value }) => {
-                    let response_stream = reader.get_mut();
-                    let mut locked_store = locked_store.lock().unwrap();
-                    let needs_compact = {
-                        if let std::result::Result::Ok(meta) = std::fs::metadata(&locked_store.path)
-                        {
-                            meta.len() > 1024 * 1024 || locked_store.total_writes >= 10000 // 1mb i guess
-                        } else {
-                            false
-                        }
-                    };
-
+                    let mut locked_store = locked_store.lock().await;
+                    let needs_compact = std::fs::metadata(&locked_store.path)
+                        .map(|meta| meta.len() > 1024 * 1024 || locked_store.total_writes >= 10000)
+                        .unwrap_or(false);
                     if needs_compact {
                         println!("compaction started");
                         if let Err(e) = locked_store.compacter() {
@@ -57,37 +60,41 @@ pub fn handle_client(stream: TcpStream, locked_store: Arc<Mutex<KvStore>>) -> an
                     }
 
                     locked_store.set(key, value)?;
-                    writeln!(response_stream, "OK")?;
-                    response_stream.flush()?;
+                    drop(locked_store);
+                    write_half.write_all(b"OK\n").await?;
+                    write_half.flush().await?;
                 }
                 std::result::Result::Ok(Command::Get { key }) => {
-                    let response_stream = reader.get_mut();
-                    let locked_store = locked_store.lock().unwrap();
+                    let locked_store = locked_store.lock().await;
                     match locked_store.get(&key) {
-                        Some(value) => writeln!(response_stream, "value : {}", value)?,
-                        None => writeln!(response_stream, "nil")?,
+                        std::option::Option::Some(value) => {
+                            let response_stream = format!("value : {}\n", value);
+                            write_half.write_all(response_stream.as_bytes()).await?;
+                        }
+                        None => write_half.write_all(b"nil\n").await?,
                     }
-                    response_stream.flush()?;
+                    drop(locked_store);
+                    write_half.flush().await?;
                 }
                 std::result::Result::Ok(Command::Delete { key }) => {
-                    let response_stream = reader.get_mut();
-                    let mut locked_store = locked_store.lock().unwrap();
+                    let mut locked_store = locked_store.lock().await;
                     locked_store.delete(key)?;
-                    writeln!(response_stream, "Ok")?;
-                    response_stream.flush()?;
+                    drop(locked_store);
+                    write_half.write_all(b"OK\n").await?;
+                    write_half.flush().await?;
                 }
                 std::result::Result::Ok(Command::Exit) => {
-                    let response_stream = reader.get_mut();
-                    writeln!(response_stream, "Goodbye")?;
-                    response_stream.flush()?;
+                    write_half.write_all(b"GoodBye\n").await?;
+                    write_half.flush().await?;
                     break;
                 }
             },
 
             Err(e) => {
-                let response_stream = reader.get_mut();
-                writeln!(response_stream, "Error {}", e)?;
-                response_stream.flush()?;
+                let response_stream = format!("Error : {}", e);
+                write_half.write_all(response_stream.as_bytes()).await?;
+                line.clear();
+                write_half.flush().await?;
                 break;
             }
         }

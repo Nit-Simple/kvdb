@@ -1,32 +1,26 @@
 mod command;
 mod kv_store;
 
-use std::{
-    net::TcpListener,
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::sync::Arc;
+
+use tokio::{net::TcpListener, sync::Mutex};
 
 use kv_store::KvStore;
 
-fn main() -> anyhow::Result<()> {
+use crate::kv_store::handle_client;
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     let kvstore = KvStore::new("log/store.log".into())?;
-    let store = Arc::new(Mutex::new(kvstore));
-    let listener = TcpListener::bind("127.0.0.1:8082")?;
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                let store_clone = Arc::clone(&store);
-                thread::spawn(move || {
-                    if let Err(e) = kv_store::handle_client(stream, store_clone) {
-                        eprintln!("client error {}", e);
-                    }
-                });
+    let store_state = Arc::new(Mutex::new(kvstore));
+    let listener: tokio::net::TcpListener = TcpListener::bind("127.0.0.1:8082").await?;
+    loop {
+        let store = Arc::clone(&store_state);
+        let (stream, _) = listener.accept().await?;
+        tokio::task::spawn(async move {
+            if let Err(e) = handle_client(stream, store).await {
+                println!("error handling client {:?}", e);
             }
-            Err(e) => {
-                eprintln!("connection failed {}", e);
-            }
-        }
+        });
     }
     Ok(())
 }
