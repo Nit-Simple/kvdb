@@ -1,13 +1,13 @@
 mod command;
 mod kv_store;
-
+mod client;
 use std::sync::Arc;
 
 use tokio::{net::TcpListener, sync::Mutex};
 
 use kv_store::KvStore;
 
-use crate::kv_store::handle_client;
+use crate::client::handle_client;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let kvstore = KvStore::new("log/store.log".into())?;
@@ -22,5 +22,4 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    Ok(())
 }
